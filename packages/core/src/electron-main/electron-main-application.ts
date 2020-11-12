@@ -14,20 +14,21 @@
  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
  ********************************************************************************/
 
+import { FrontendApplicationConfig } from '@theia/application-package/lib/application-props';
+import { fork, ForkOptions } from 'child_process';
+import { app, BrowserWindow, BrowserWindowConstructorOptions, dialog, Event as ElectronEvent, globalShortcut, screen } from 'electron';
+import { promises as fs } from 'fs';
 import { inject, injectable, named } from 'inversify';
-import { session, screen, globalShortcut, app, BrowserWindow, BrowserWindowConstructorOptions, Event as ElectronEvent, dialog } from 'electron';
+import { AddressInfo } from 'net';
 import * as path from 'path';
 import { Argv } from 'yargs';
-import { AddressInfo } from 'net';
-import { promises as fs } from 'fs';
-import { fork, ForkOptions } from 'child_process';
-import { FrontendApplicationConfig } from '@theia/application-package/lib/application-props';
-import URI from '../common/uri';
-import { FileUri } from '../node/file-uri';
+import { ContributionProvider } from '../common/contribution-provider';
 import { Deferred } from '../common/promise-util';
 import { MaybePromise } from '../common/types';
-import { ContributionProvider } from '../common/contribution-provider';
-import { ElectronSecurityToken } from '../electron-common/electron-token';
+import URI from '../common/uri';
+import { FileUri } from '../node/file-uri';
+import { ElectronSecurityTokenService } from './electron-security-token-service';
+
 const Storage = require('electron-store');
 const createYargs: (argv?: string[], cwd?: string) => Argv = require('yargs/yargs');
 
@@ -162,16 +163,18 @@ export class ElectronMainApplication {
     @inject(ElectronMainApplicationGlobals)
     protected readonly globals: ElectronMainApplicationGlobals;
 
-    @inject(ElectronSecurityToken)
-    protected electronSecurityToken: ElectronSecurityToken;
-
     @inject(ElectronMainProcessArgv)
     protected processArgv: ElectronMainProcessArgv;
 
-    protected readonly electronStore = new Storage();
-    protected readonly backendPort = new Deferred<number>();
+    @inject(ElectronSecurityTokenService)
+    protected electronSecurityTokenService: ElectronSecurityTokenService;
 
-    protected _config: FrontendApplicationConfig;
+    protected readonly electronStore = new Storage();
+
+    protected readonly _backendPort = new Deferred<number>();
+    readonly backendPort = this._backendPort.promise;
+
+    protected _config: FrontendApplicationConfig | undefined;
     get config(): FrontendApplicationConfig {
         if (!this._config) {
             throw new Error('You have to start the application first.');
@@ -181,9 +184,10 @@ export class ElectronMainApplication {
 
     async start(config: FrontendApplicationConfig): Promise<void> {
         this._config = config;
+        this.prepareEnv();
         this.hookApplicationEvents();
         const port = await this.startBackend();
-        this.backendPort.resolve(port);
+        this._backendPort.resolve(port);
         await app.whenReady();
         await this.attachElectronSecurityToken(port);
         await this.startContributions();
@@ -280,8 +284,8 @@ export class ElectronMainApplication {
     }
 
     protected async createWindowUri(): Promise<URI> {
-        const port = await this.backendPort.promise;
-        return FileUri.create(this.globals.THEIA_FRONTEND_HTML_PATH).withQuery(`port=${port}`);
+        return FileUri.create(this.globals.THEIA_FRONTEND_HTML_PATH)
+            .withQuery(`port=${await this.backendPort}`);
     }
 
     protected getDefaultWindowState(): BrowserWindowConstructorOptions {
@@ -402,7 +406,6 @@ export class ElectronMainApplication {
         // Otherwise, the forked backend processes will not know that they're serving the electron frontend.
         process.env.THEIA_ELECTRON_VERSION = process.versions.electron;
         if (noBackendFork) {
-            process.env[ElectronSecurityToken] = JSON.stringify(this.electronSecurityToken);
             // The backend server main file is supposed to export a promise resolving with the port used by the http(s) server.
             const address: AddressInfo = await require(this.globals.THEIA_BACKEND_MAIN_PATH);
             return address.port;
@@ -430,21 +433,15 @@ export class ElectronMainApplication {
     }
 
     protected async getForkOptions(): Promise<ForkOptions> {
-        return {
-            env: {
-                ...process.env,
-                [ElectronSecurityToken]: JSON.stringify(this.electronSecurityToken),
-            },
-        };
+        return { env: process.env };
     }
 
     protected async attachElectronSecurityToken(port: number): Promise<void> {
-        session.defaultSession.cookies.set({
-            url: `http://localhost:${port}/`,
-            name: ElectronSecurityToken,
-            value: JSON.stringify(this.electronSecurityToken),
-            httpOnly: true
-        });
+        await this.electronSecurityTokenService.setElectronSecurityTokenCookie(`http://localhost:${port}`);
+    }
+
+    protected prepareEnv(): void {
+        this.electronSecurityTokenService.setElectronSecurityTokenEnv(process.env);
     }
 
     protected hookApplicationEvents(): void {
